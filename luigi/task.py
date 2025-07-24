@@ -39,6 +39,8 @@ from luigi.task_register import Register
 from luigi.parameter import ParameterVisibility
 from luigi.parameter import UnconsumedParameterWarning
 
+from luigi.freezing import FrozenOrderedDict, recursively_unfreeze
+
 Parameter = parameter.Parameter
 logger = logging.getLogger('luigi-interface')
 
@@ -465,8 +467,23 @@ class Task(metaclass=Register):
         params = self.get_params()
         param_values = self.get_param_values(params, args, kwargs)
 
+        def check_frozen(obj):
+            """
+                Check recursively if value contains any FrozenOrderedDict, return True if it does.
+                Object is a list.
+            """
+            if isinstance(obj, FrozenOrderedDict):
+                return True
+            elif isinstance(obj, dict):
+                return any(check_frozen(v) for v in obj.values())
+            elif isinstance(obj, (list, tuple, set)):
+                return any(check_frozen(v) for v in obj)
+            return False
+
         # Set all values on class instance
         for key, value in param_values:
+            if check_frozen(value):
+                value = recursively_unfreeze(value)
             setattr(self, key, value)
 
         # Register kwargs as an attribute on the class. Might be useful
