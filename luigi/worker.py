@@ -116,13 +116,13 @@ class TaskProcess(multiprocessing.Process):
         "scheduler_messages": "scheduler_messages",
     }
 
-    def __init__(self, task, worker_id, result_queue, status_reporter,
+    def __init__(self, task, worker_id, result_connection, status_reporter,
                  use_multiprocessing=False, worker_timeout=0, check_unfulfilled_deps=True,
                  check_complete_on_run=False, task_completion_cache=None):
         super(TaskProcess, self).__init__()
         self.task = task
         self.worker_id = worker_id
-        self.result_queue = result_queue
+        self.result_connection = result_connection
         self.status_reporter = status_reporter
         self.worker_timeout = task.worker_timeout if task.worker_timeout is not None else worker_timeout
         self.timeout_time = time.time() + self.worker_timeout if self.worker_timeout else None
@@ -240,8 +240,9 @@ class TaskProcess(multiprocessing.Process):
             expl = self._handle_run_exception(ex)
 
         finally:
-            self.result_queue.put(
+            self.result_connection.send(
                 (self.task.task_id, status, expl, missing, new_deps))
+            self.result_connection.close()
 
     def _handle_run_exception(self, ex):
         logger.exception("[pid %s] Worker %s failed    %s", os.getpid(), self.worker_id, self.task)
@@ -602,7 +603,7 @@ class Worker:
                 pass
 
         # Keep info about what tasks are running (could be in other processes)
-        self._task_result_queue = multiprocessing.Queue()
+        self._task_result_pipes = {}  # Dictionary to store pipes for each task
         self._running_tasks = {}
         self._idle_since = None
 
@@ -659,7 +660,13 @@ class Worker:
         for task in self._running_tasks.values():
             if task.is_alive():
                 task.terminate()
-        self._task_result_queue.close()
+        # Close all remaining pipes
+        for parent_conn, child_conn in self._task_result_pipes.values():
+            try:
+                parent_conn.close()
+                child_conn.close()
+            except:
+                pass
         return False  # Don't suppress exception
 
     def _generate_worker_info(self):
@@ -1066,11 +1073,16 @@ class Worker:
 
     def _create_task_process(self, task):
         message_queue = multiprocessing.Queue() if task.accepts_messages else None
+        
+        # Create a pipe for this specific task
+        parent_conn, child_conn = multiprocessing.Pipe()
+        self._task_result_pipes[task.task_id] = (parent_conn, child_conn)
+        
         reporter = TaskStatusReporter(self._scheduler, task.task_id, self._id, message_queue)
         use_multiprocessing = self._config.force_multiprocessing or bool(self.worker_processes > 1)
         return ContextManagedTaskProcess(
             self._config.task_process_context,
-            task, self._id, self._task_result_queue, reporter,
+            task, self._id, child_conn, reporter,
             use_multiprocessing=use_multiprocessing,
             worker_timeout=self._config.timeout,
             check_unfulfilled_deps=self._config.check_unfulfilled_deps,
@@ -1080,7 +1092,7 @@ class Worker:
 
     def _purge_children(self):
         """
-        Find dead children and put a response on the result queue.
+        Find dead children and send response via their respective pipes.
 
         :return:
         """
@@ -1096,13 +1108,20 @@ class Worker:
                 continue
 
             logger.info(error_msg)
-            self._task_result_queue.put((task_id, FAILED, error_msg, [], []))
+            # Send error message via the task's pipe
+            if task_id in self._task_result_pipes:
+                parent_conn, child_conn = self._task_result_pipes[task_id]
+                try:
+                    child_conn.send((task_id, FAILED, error_msg, [], []))
+                    child_conn.close()
+                except:
+                    pass  # Pipe might already be closed
 
     def _handle_next_task(self):
         """
         We have to catch three ways a task can be "done":
 
-        1. normal execution: the task runs/fails and puts a result back on the queue,
+        1. normal execution: the task runs/fails and sends a result back via pipe,
         2. new dependencies: the task yielded new deps that were not complete and
            will be rescheduled and dependencies added,
         3. child process dies: we need to catch this separately.
@@ -1111,12 +1130,33 @@ class Worker:
         while True:
             self._purge_children()  # Deal with subprocess failures
 
-            try:
-                task_id, status, expl, missing, new_requirements = (
-                    self._task_result_queue.get(
-                        timeout=self._config.wait_interval))
-            except Queue.Empty:
+            # Check all pipes for available data
+            task_id = None
+            result_data = None
+            
+            for tid, (parent_conn, child_conn) in list(self._task_result_pipes.items()):
+                try:
+                    if parent_conn.poll(self._config.wait_interval):
+                        result_data = parent_conn.recv()
+                        task_id = tid
+                        parent_conn.close()
+                        child_conn.close()
+                        del self._task_result_pipes[tid]
+                        break
+                except (EOFError, OSError):
+                    # Pipe was closed, remove it
+                    try:
+                        parent_conn.close()
+                        child_conn.close()
+                    except:
+                        pass
+                    del self._task_result_pipes[tid]
+                    continue
+            
+            if task_id is None or result_data is None:
                 return
+                
+            task_id, status, expl, missing, new_requirements = result_data
 
             task = self._scheduled_tasks[task_id]
             if not task or task_id not in self._running_tasks:
